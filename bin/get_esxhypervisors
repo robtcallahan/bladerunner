@@ -1,0 +1,493 @@
+#!/usr/bin/php
+<?php
+
+chdir(__DIR__);
+
+include __DIR__ . "/../config/global.php";
+
+use \STS\SNCache\ServerTable;
+
+try {
+    // config
+    $config = $GLOBALS['config'];
+
+    // get the command line options
+    $options = parseOptions();
+
+    // check to see if we should run
+    if (!$config->runCronJobs && !$options->forceRun) {
+        print "runCronJobs is set to false in the config file. Exiting...\n";
+        exit;
+    }
+
+    /*********************************************************************/
+    /******************** Log Files & Headers ****************************/
+    /*********************************************************************/
+
+    // general definitions
+    $title      = "Blade Runner: ESX Hypervisors Report";
+    $scriptName = $argv[0];
+    $now        = date("Y-m-d-H-i");
+    $startTime  = time();
+
+    $optsNameWidth    = 25;
+    $summaryNameWidth = 30;
+
+    // open the log file; also keep a log string to send in email if exception is thrown
+    $logString  = "";
+    $logFile    = "{$config->logDir}/{$config->esxHypersLogFile}.{$now}";
+    $logFilePtr = fopen($logFile, "w");
+
+    $release = trim(file_get_contents("../ABOUT"));
+
+    $logHeader = "{$title} Log\n" .
+        "\n" .
+        "Release:    {$release}\n" .
+        "Host:       " . gethostname() . "\n" .
+        "SN Site:    {$config->servicenow->site}\n" .
+        "Script:     " . implode(' ', $argv) . "\n" .
+        "Start Time: " . date("Y-m-d H:i:s", $startTime) . "\n" .
+        "\n" .
+        "Options: \n" .
+        sprintf("\t %-{$optsNameWidth}s = %s\n", "StdOut", $options->stdOut ? "true" : "false") .
+        sprintf("\t %-{$optsNameWidth}s = %s\n", "Force Run", $options->forceRun ? "true" : "false") .
+        "\n";
+    outlog($logHeader);
+
+
+    // prune old log files
+    outlog("Cleaning up old log files...\n");
+    $logFiles        = explode("\n", `ls -t $config->logDir/$config->esxHypersLogFile.*`);
+    $todayMinusPrune = $startTime - (60 * 60 * 24 * $config->pruneAfter);
+    $todayMinus1     = $startTime - (60 * 60 * 24 * 1);
+    for ($i = 0; $i < count($logFiles); $i++) {
+        $f = $logFiles[$i];
+        if ($f === "") break;
+
+        $stat  = stat($f);
+        $mTime = $stat[9];
+        if ($mTime < $todayMinusPrune) {
+            // log file is older than 7 days; delete
+            outlog("\tPruning {$f} - " . date("Y-m-d H:i:s", $mTime) . "\n");
+            unlink($f);
+        } else if ($config->compressLogs && !preg_match("/.*\.gz$/", $f) && $mTime < $todayMinus1) {
+            // log file is older than 1 day; compress
+            outlog("\tCompressing {$f} - " . date("Y-m-d H:i:s", $mTime) . "\n");
+            $out = `gzip $f`;
+        }
+    }
+    outlog("\n");
+
+    /*********************************************************************/
+    /************************* Initialization ****************************/
+    /*********************************************************************/
+
+    // init summary stats
+    $summary = (object)array(
+        "numDataCenters" => 0,
+        "numClusters"    => 0,
+        "numHypers"      => 0,
+        "numVMs"         => 0,
+        "numLinux"       => 0,
+        "numWindows"     => 0,
+        "numUnknown"     => 0,
+    );
+
+    $esxHosts = array();
+
+    // convert the database object to an array for the SNCache library to use
+    $configArray = array(
+        "databases" => array(
+            "sncache" => array(
+                "type"        => "postgres",
+                "server"      => "sn_cache_db.ops.neustar.biz",
+                "username"    => "at_sn_cache",
+                "password"    => ";JOtaiVP`;D",
+                "database"    => "sn_cache_db",
+                "port"        => "3115",
+                "schema"      => "sn_cache_prod",
+                "clientFlags" => "0"
+            ),
+        ),
+    );
+
+    $serverTable = new ServerTable($configArray);
+
+    /*********************************************************************/
+    /**************************** Main ***********************************/
+    /*********************************************************************/
+
+    // get VMware data centers
+    outlog("Getting data centers...\n");
+    $queryStartTime = time();
+    $results        = getNeumaticAPICurl("vmware/getDataCenters");
+    if (property_exists($results, 'success') && !$results->success) {
+        throw new ErrorException("NeuMatic API call to vmware/getDataCenters failed: " . $results->error);
+    }
+    $dataCenters             = $results->dataCenters;
+    $numDataCenters          = count($dataCenters);
+    $summary->numDataCenters = $numDataCenters;
+    outlog("\t" . timing($queryStartTime, $numDataCenters . " data centers returned\n"));
+
+    $d        = 0;
+    foreach ($dataCenters as $dataCenter) {
+        // skip windows datacenters
+        #if (preg_match("/[st|ch]nt/", $dataCenter->vSphereServer)) continue;
+        #if ($dataCenter->name != "Sterling" || $dataCenter->vSphereServer != "stopvcenter04.va.neustar.com") continue;
+
+        $d++;
+        outlog(sprintf("[%2d of %2d] %-20s getting clusters...  ", $d, $numDataCenters, $dataCenter->name));
+
+        // get the list of clusters for each DC
+        $clusters = array();
+        $queryStartTime = time();
+        $results        = getNeumaticAPICurl("vmware/getClusterComputeResources/{$dataCenter->uid}", $dataCenter->vSphereSite);
+
+        if ((property_exists($results, 'success') && !$results->success)) {
+            $error = "NeuMatic API call to vmware/getClusterComputeResources/{$dataCenter->uid}?site={$dataCenter->vSphereSite} failed";
+            if (property_exists($results, 'error')) {
+                $error .= ": " . $results->error;
+            } else if (!property_exists($results, 'clusters')) {
+                outlog("        No results returned\n");
+                continue;
+            } else {
+                $error .= "No error msg available";
+            }
+            outlog("        ERROR: {$error}\n");
+            continue;
+        } else if (!property_exists($results, 'clusters')) {
+            outlog("        No results returned\n");
+            continue;
+        }
+        $clusters = $results->clusters;
+        $numClusters = count($clusters);
+        outlog(timing($queryStartTime, strval($numClusters)) . " clusters found\n");
+
+        $summary->numClusters += $numClusters;
+
+        outlog("\nGetting host systems and VMs...\n");
+        $c = 0;
+        foreach ($clusters as $cluster) {
+            #if ($cluster->name != "ST_OMS") continue;
+
+            $c++;
+            outlog(sprintf("[%2d of %2d] %-15s [%2d of %2d] %-20s (%-10s) ", $d, $numDataCenters, $dataCenter->name, $c, $numClusters, $cluster->name, $cluster->uid));
+
+            $queryStartTime = time();
+            $results        = getNeumaticAPICurl("vmware/getHostSystemsByClusterComputeResource/{$cluster->uid}", $cluster->vSphereSite);
+
+            if ((property_exists($results, 'success') && !$results->success)) {
+                $error = "NeuMatic API call to vmware/getHostSystemsByClusterComputeResource/{$cluster->uid}?site={$cluster->vSphereSite} failed";
+                if (property_exists($results, 'error')) {
+                    $error .= ": " . $results->error;
+                } else if (!property_exists($results, 'hostSystems')) {
+                    outlog("No results returned\n");
+                    continue;
+                } else {
+                    $error .= "No error msg available";
+                }
+                outlog("ERROR: {$error}\n");
+                continue;
+            } else if (!property_exists($results, 'hostSystems')) {
+                outlog("No results returned\n");
+                continue;
+            }
+
+            outlog(timing($queryStartTime, count($results->hostSystems) . " host systems found\n"));
+            $hostSystems = $results->hostSystems;
+            $numHypers = count($hostSystems);
+            $summary->numHypers += $numHypers;
+
+            $h = 0;
+            foreach ($hostSystems as $hs) {
+                #if ($hs->name != "stomcpresx24.va.neustar.com") continue;
+
+                foreach (array("vSphereSite", "vSphereServer", "dcUid", "dcName", "ccrUid", "ccrName") as $prop) {
+                    $hs->$prop = $cluster->$prop;
+                }
+                $hs->status = "OK";
+
+                $h++;
+                outlog(sprintf("[%2d of %2d] %-15s [%2d of %2d] %-20s (%-10s) [%2d of %2d] %-40s ", $d, $numDataCenters, $dataCenter->name, $c, $numClusters, $cluster->name, $cluster->uid, $h, $numHypers, $hs->name));
+                $queryStartTime = time();
+                try {
+                    $results = getNeumaticAPICurl("vmware/getVMsByHostSystemUid/{$hs->uid}", $hs->vSphereSite);
+                } catch (ErrorException $e) {
+                    $error = "Error: vmware/getVMsByHostSystemUid/{$hs->uid}?site={$hs->vSphereSite} DC={$hs->dcName} CCR={$hs->ccrName} HS={$hs->name}";
+                    if ($e->getMessage()) {
+                        $error .= ": {$e->getMessage()}";
+                    }
+                    outlog("\nERROR: {$error}\n");
+                    continue;
+                }
+
+                if ((property_exists($results, 'success') && !$results->success)) {
+                    $error = "NeuMatic API call to vmware/getVMsByHostSystemUid/{$hs->uid}?site={$hs->vSphereSite} failed";
+                    if (property_exists($results, 'error')) {
+                        $error .= ": " . $results->error;
+                    } else if (!property_exists($results, 'vms')) {
+                        outlog("No results returned\n");
+                        continue;
+                    } else {
+                        $error .= "No error msg available";
+                    }
+                    outlog("\nERROR: {$error}\n");
+                    continue;
+                } else if (!property_exists($results, 'vms')) {
+                    outlog("No results returned\n");
+                    continue;
+                }
+                outlog(timing($queryStartTime, count($results->vms) . " VMs found\n"));
+                $summary->numVMs += count($results->vms);
+
+                // file_put_contents("esx-hypers.json", unserialize(file_get_contents("esx-hypers.json.ser")));
+
+                // collect only the necessary info from the vm config
+                $vms     = $results->vms;
+                $hs->vms = array();
+
+                if ($hs->name == "stomcpresx24.va.neustar.com") outlog("Entering foreach vms as vm\n");
+
+                foreach ($vms as $vm) {
+                    if (!property_exists($vm, 'name')) {
+                        outlog(sprintf("%20s %-40s ", " ", "name not found"));
+                        continue;
+                    }
+                    // skip template VMs
+                    if (preg_match("/[Tt]emplate|Unknown/", $vm->name)) {
+                        $hs->vms = array();
+                        #$esxHosts[$hs->name] = $hs;
+                        continue;
+                    }
+
+                    $name = strtolower($vm->name);
+                    outlog(sprintf("%20s %-40s ", " ", $name));
+                    $obj         = (object)array();
+                    $obj->name   = $name;
+                    $obj->status = "";
+
+                    if (property_exists($vm, 'config') && property_exists($vm->config, 'guestFullName')) {
+                        if (preg_match("/Linux|CentOS/", $vm->config->guestFullName)) {
+                            $obj->osType = "Linux";
+                            $summary->numLinux++;
+                        } else if (preg_match("/Windows/", $vm->config->guestFullName)) {
+                            $obj->osType = "Windows";
+                            $summary->numWindows++;
+                        } else {
+                            $obj->osType = "Unknown";
+                            $summary->numUnknown++;
+                        }
+                    } else {
+                        outlog(sprintf("%-30s ", " "));
+                        $obj->osType = "Unknown";
+                        $summary->numUnknown++;
+                    }
+                    $numCPU   = "-";
+                    $memoryGB = "-";
+                    if (property_exists($vm, 'config') && property_exists($vm->config, 'hardware')) {
+                        if (property_exists($vm->config->hardware, 'numCPU')) {
+                            $numCPU = $vm->config->hardware->numCPU;
+                        }
+                        if (property_exists($vm->config->hardware, 'memoryMB')) {
+                            $memoryGB = round($vm->config->hardware->memoryMB / 1024, 2);
+                        }
+                    }
+                    $obj->numCPU   = $numCPU;
+                    $obj->memoryGB = $memoryGB;
+
+                    $overallCpuUsageMHz = "-";
+                    $guestMemUsageGB    = "-";
+                    if (property_exists($vm, 'quickStats')) {
+                        if (property_exists($vm->quickStats, 'overallCpuUsage')) {
+                            $overallCpuUsageMHz = $vm->quickStats->overallCpuUsage;
+                        }
+                        if (property_exists($vm->quickStats, 'guestMemoryUsage')) {
+                            $guestMemUsageGB = round($vm->quickStats->guestMemoryUsage / 1024, 2);
+                        }
+                    }
+                    $obj->overallCpuUsageMHz = $overallCpuUsageMHz;
+                    $obj->guestMemUsageGB    = $guestMemUsageGB;
+
+                    // get the business service
+                    $obj->businessService = "-";
+                    $cmdbServer           = $serverTable->getByName($vm->name);
+                    if ($cmdbServer->getSysId()) {
+                        $obj->businessService = $cmdbServer->getBusinessServices();
+                    }
+
+                    $hs->vms[$obj->name] = $obj;
+                    outlog(sprintf("CPU: %3d (%5dMHz)  MEM: %3d (%4.2fGB)  OS: %-10s    %s\n", $obj->numCPU, $obj->overallCpuUsageMHz, $obj->memoryGB, $obj->guestMemUsageGB, $obj->osType, $obj->businessService));
+                } // foreach ($vms as $vm)
+                if ($hs->name == "stomcpresx24.va.neustar.com") outlog("Exiting foreach vms as vm\n");
+                $esxHosts[$hs->name] = $hs;
+            } // foreach ($hostSystems as $hs)
+        } // foreach ($clusters as $cluster)
+    }
+    $outfile = "{$config->dataDir}/{$config->esxHypersJsonFile}";
+    file_put_contents($outfile, serialize(json_encode($esxHosts)));
+
+    outlog(generateSummary());
+    fclose($logFilePtr);
+
+/*********************************************************************/
+/******************** Exception Catcher ******************************/
+/*********************************************************************/
+} catch
+    (Exception $e) {
+        global $options, $logString, $config, $title;
+
+        $emailTo   = $config->adminEmail;
+        $emailFrom = $config->adminEmail;
+        $emailSubj = "{$title} Error Report";
+
+        $headers = implode("\r\n", array(
+            "MIME-Version: 1.0",
+            "Content-type: text/html; charset=us-ascii",
+            "From: {$emailFrom}",
+            "Reply-To: {$emailFrom}",
+            "X-Priority: 1",
+            "X-MSMail-Priority: High",
+            "X-Mailer: PHP/" . phpversion()
+        ));
+
+        $traceBack = "returnCode: 1\n" .
+            "errorCode:  {$e->getCode()}\n" .
+            "errorText:  {$e->getMessage()}\n" .
+            "errorFile:  {$e->getFile()}\n" .
+            "errorLine:  {$e->getLine()}\n" .
+            "errorStack: {$e->getTraceAsString()}\n";
+
+        outlog("{$traceBack}\n");
+
+        if (isset($summary)) {
+            outlog(generateSummary());
+        }
+
+        if (!$options->stdOut) {
+            $emailBody = "<pre style='font-size:6pt;'>\n" .
+                "{$logString}\n" .
+                "</pre>\n";
+            mail($emailTo, $emailSubj, $emailBody, $headers);
+        }
+        exit;
+    }
+
+function getNeumaticAPICurl($method, $vSphereSite = "") {
+    global $config, $output;
+
+    // TODO: get rid if this string!
+    $url = "https://neumatic.ops.neustar.biz/{$method}";
+    if ($vSphereSite) {
+        $url .= "?vSphereSite={$vSphereSite}";
+    }
+
+    $crypt    = new \STS\Util\Obfuscation();
+    $username = $config->ldapWebUsername;
+    $password = $crypt->decrypt($config->ldapWebPassword);
+
+    // create a Curl instance and authenticate to the NeuMatic API
+    $curl = new \STS\Util\Curl();
+    $curl->setUsernamePassword($username, $password);
+    $curl->setUrl($url);
+    $curl->send();
+    $response = $curl->getBody();
+
+    $json = (object)array();
+    try {
+        $json = json_decode($response);
+    } catch (\ErrorException $e) {
+        throw new \ErrorException("Unable to JSON decode the response from VMWare: " . $e->getMessage());
+    }
+    if (!is_object($json)) {
+        $json = (object)array(
+            "url" => $url
+        );
+    }
+    return $json;
+}
+
+function timing($startTime, $msg) {
+    $endTime     = time();
+    $elapsedSecs = $endTime - $startTime;
+    return sprintf("[elapsed %02d:%02d] %s", floor($elapsedSecs / 60), $elapsedSecs % 60, $msg);
+}
+
+function parseOptions() {
+    // command line opts
+    $opts = getopt('hsr');
+
+    // usage if -h
+    if ($opts && array_key_exists('h', $opts)) usage();
+
+    // define options
+    $options = (object)array(
+        "stdOut"   => array_key_exists('s', $opts) ? true : false,
+        "forceRun" => array_key_exists('r', $opts) ? true : false
+    );
+    return $options;
+}
+
+function usage() {
+    print "Usage: get_esx_hypervisors [-hrs]\n";
+    print "\n";
+    print "       -h         this help\n";
+    print "       -s         outlog to STDOUT in real time\n";
+    print "       -r         force run even if runCronJobs is false\n";
+    exit;
+}
+
+function generateSummary() {
+    global $startTime, $summary, $summaryNameWidth;
+
+    // calc elapsed time
+    $endTime       = time();
+    $elapsedSecs   = $endTime - $startTime;
+    $elapsedFormat = sprintf("%02d:%02d", floor($elapsedSecs / 60), $elapsedSecs % 60);
+
+    return sprintf("\n\nSummary\n%'-60s\n", "") .
+
+    sumOutput("Num Data Centers", $summary->numDataCenters) .
+    sumOutput("Num Clusters", $summary->numClusters) .
+    sumOutput("Num Hypervisors", $summary->numHypers) .
+    sumOutput("Num VMs", $summary->numVMs) .
+    sumOutput("Num Linux VMs", $summary->numLinux, $summary->numVMs) .
+    sumOutput("Num Windows VMs", $summary->numWindows, $summary->numVMs) .
+    sumOutput("Num Unknown VMs", $summary->numUnknown, $summary->numVMs) .
+    "\n" .
+
+    sprintf("%-{$summaryNameWidth}s: %s\n", "Start Time", date("Y-m-d H:i:s", $startTime)) .
+    sprintf("%-{$summaryNameWidth}s: %s\n", "End Time", date("Y-m-d H:i:s", $endTime)) .
+    sprintf("%-{$summaryNameWidth}s: %s\n", "Elapsed Time", $elapsedFormat) .
+    "";
+}
+
+function sumOutput($title, $count, $total = null) {
+    global $summaryNameWidth;
+
+    if ($total) {
+        return sprintf("%-{$summaryNameWidth}s: %5d (%4.1f%%)\n", $title, $count, round($count / $total * 100, 1));
+    } else {
+        return sprintf("%-{$summaryNameWidth}s: %5d\n", $title, $count);
+    }
+}
+
+function outlog($logMsg) {
+    global $options, $logFilePtr, $logString;
+
+    if ($options->stdOut) {
+        print $logMsg;
+    }
+    fwrite($logFilePtr, $logMsg);
+    $logString .= $logMsg;
+}
+
+function printException(\ErrorException $e) {
+    outlog("\n");
+    outlog(sprintf("%-12s => %s\n", "returnCode", 1));
+    outlog(sprintf("%-12s => %s\n", "errorCode", $e->getCode()));
+    outlog(sprintf("%-12s => %s\n", "errorText", $e->getMessage()));
+    outlog(sprintf("%-12s => %s\n", "errorFile", $e->getFile()));
+    outlog(sprintf("%-12s => %s\n", "errorLine", $e->getLine()));
+    outlog(sprintf("%-12s => \n%s\n", "errorStack", $e->getTraceAsString()));
+    exit;
+}

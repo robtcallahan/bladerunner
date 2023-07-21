@@ -1,0 +1,2 @@
+# Get the data from vSphere for all hypers and VMs
+0 0,4,8,12,16,20 * * * stsapps /var/www/html/bladerunner/bin/get_esxhypervisors > /var/www/html/bladerunner/log/get_esxhypervisors.log 2>&1

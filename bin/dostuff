@@ -1,0 +1,149 @@
+#!/usr/bin/php
+<?php
+
+include __DIR__ . "/../config/global.php";
+
+use STS\HPSIM\HPSIMBladeTable;
+
+use STS\SANScreen\SANScreen;
+use STS\SANScreen\SANScreenHostTable;
+use STS\SANScreen\SANScreenArrayTable;
+
+use STS\CMDB\CMDBStorageDeviceTable;
+use STS\CMDB\CMDBBusinessServiceTable;
+
+try
+{
+	$config = $GLOBALS['config'];
+
+    #$hostSystem = "stomcpresx24.va.neustar.com";
+    $hostSystem = "stopcpresx01.va.neustar.com";
+
+    // get VMware data centers
+    outlog("Getting data centers...\n");
+    $queryStartTime = time();
+    $results        = getNeumaticAPICurl("vmware/getVMsByHostSystem/{$hostSystem}", "prod4");
+    if (property_exists($results, 'success') && !$results->success) {
+        throw new ErrorException("NeuMatic API call to vmware/getDataCenters failed: " . $results->error);
+    }
+
+
+
+    print "results=" . print_r($results, true) . "\n";
+    exit;
+
+    $dataCenters             = $results->dataCenters;
+    $numDataCenters = count($dataCenters);
+    outlog("\t" . timing($queryStartTime, $numDataCenters . " data centers returned\n"));
+
+    // get the list of clusters for each DC
+    outlog("\nGetting clusters...\n");
+    $clusters = array();
+    $d        = 0;
+    foreach ($dataCenters as $dataCenter) {
+        // skip windows datacenters
+        #if (preg_match("/[st|ch]nt/", $dataCenter->vSphereServer)) continue;
+        #if ($dataCenter->vSphereServer == "stopvcenter02.va.neustar.com") continue;
+        $d++;
+        outlog(sprintf("[%2d of %2d] %-20s ", $d, $numDataCenters, $dataCenter->name));
+        $queryStartTime = time();
+        $results        = getNeumaticAPICurl("vmware/getClusterComputeResources/{$dataCenter->uid}", $dataCenter->vSphereSite);
+
+        if ((property_exists($results, 'success') && !$results->success)) {
+            $error = "NeuMatic API call to vmware/getClusterComputeResources/{$dataCenter->uid}?site={$dataCenter->vSphereSite} failed";
+            if (property_exists($results, 'error')) {
+                $error .= ": " . $results->error;
+            } else if (!property_exists($results, 'clusters')) {
+                outlog("        No results returned\n");
+                continue;
+            } else {
+                $error .= "No error msg available";
+            }
+            outlog("        ERROR: {$error}\n");
+            continue;
+        } else if (!property_exists($results, 'clusters')) {
+            outlog("        No results returned\n");
+            continue;
+        }
+        outlog(timing($queryStartTime, strval(count($results->clusters)) . " clusters found\n"));
+        $clusters = array_merge($clusters, $results->clusters);
+    }
+}
+
+catch(Exception $e)
+{
+	print_r(
+		array(
+			"returnCode" => 1,
+			"errorCode"  => $e->getCode(),
+			"errorText"  => $e->getMessage(),
+			"errorFile"  => $e->getFile(),
+			"errorLine"  => $e->getLine(),
+			"errorStack" => $e->getTraceAsString()
+			)
+		);
+}
+
+function getNeumaticAPICurl($method, $vSphereSite = "") {
+    global $config, $output;
+
+    $url = "https://neumatic-dev.ops.neustar.biz/{$method}";
+    if ($vSphereSite) {
+        $url .= "?vSphereSite={$vSphereSite}";
+    }
+
+    $crypt    = new \STS\Util\Obfuscation();
+    $username = $config->ldapWebUsername;
+    $password = $crypt->decrypt($config->ldapWebPassword);
+
+    // create a Curl instance and authenticate to the NeuMatic API
+    $curl = new \STS\Util\Curl();
+    $curl->setUsernamePassword($username, $password);
+    $curl->setUrl($url);
+    $curl->send();
+    $response = $curl->getBody();
+
+    $json = (object)array();
+    try {
+        $json = json_decode($response);
+    } catch (\ErrorException $e) {
+        throw new \ErrorException("Unable to JSON decode the response from VMWare: " . $e->getMessage());
+    }
+    if (!is_object($json)) {
+        $json = (object)array(
+            "url" => $url,
+            "response" => print_r($response, true)
+        );
+    }
+    return $json;
+}
+
+function timing($startTime, $msg) {
+    $endTime     = time();
+    $elapsedSecs = $endTime - $startTime;
+    return sprintf("[elapsed %02d:%02d] %s", floor($elapsedSecs / 60), $elapsedSecs % 60, $msg);
+}
+
+function outlog($logMsg) {
+    print $logMsg;
+}
+
+/**
+ * @param $a CMDBStorageDevice
+ * @param $b CMDBStorageDevice
+ */
+function sortByBS(STS\CMDB\CMDBStorageDevice $a, STS\CMDB\CMDBStorageDevice $b)
+{
+    return strcmp($a->getBusinessService(), $b->getBusinessService());
+}
+
+/**
+ * @param $a CMDBBusinessService
+ * @param $b CMDBBusinessService
+ */
+function sortByName(CMDBBusinessService $a, CMDBBusinessService $b)
+{
+    return strcmp($a->getName(), $b->getName());
+}
+
+
